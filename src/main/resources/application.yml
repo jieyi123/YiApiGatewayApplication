@@ -15,3 +15,14 @@ logging:
       springframework:
         cloud:
           gateway: trace   #日志级别为最低
+
+dubbo:
+  application:
+    name: nacos-registry-demo-consumer
+    # 指定使用 Dubbo 协议，且端口设置为 22223
+    qos-port: 33333
+  protocol:
+    name: dubbo
+    port: -1
+  registry:
+    address: nacos://172.17.0.3:8848

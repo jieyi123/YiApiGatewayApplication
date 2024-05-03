@@ -1,8 +1,13 @@
 package com.pjieyi.yiapigatewayapplication;
 
-import com.pjieyi.yiapiclientsdk.client.YiApiClient;
 import com.pjieyi.yiapiclientsdk.utils.SignUtils;
+import com.pjieyi.yiapicommon.model.entity.InterfaceInfo;
+import com.pjieyi.yiapicommon.model.entity.User;
+import com.pjieyi.yiapicommon.service.InnerInterfaceInfoService;
+import com.pjieyi.yiapicommon.service.InnerUserInterfaceInfoService;
+import com.pjieyi.yiapicommon.service.InnerUserService;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.dubbo.config.annotation.DubboReference;
 import org.reactivestreams.Publisher;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
@@ -34,9 +39,20 @@ import java.util.List;
 @Component
 public class CustomGlobalFilter implements GlobalFilter, Ordered {
 
+
     //白名单
     public static final List<String> IP_WHITE_LIST= Arrays.asList("127.0.0.1");
     public static final Long FIVE_MINUTE= 5*60L;
+    public static final String INTERFACE_HOST="http://localhost:8081";
+
+    @DubboReference
+    private InnerUserService userService;
+
+    @DubboReference
+    private InnerInterfaceInfoService interfaceInfoService;
+
+    @DubboReference
+    private InnerUserInterfaceInfoService userInterfaceInfoService;
     /**
      * 全局过滤
      * @param exchange 路由交换机
@@ -48,19 +64,20 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         //1.请求日志
         ServerHttpRequest request = exchange.getRequest();
         log.info("请求唯一标识："+request.getId());
-        log.info("请求方法："+request.getMethod());
-        log.info("请求路径："+request.getPath());
+        String method = request.getMethod().toString();
+        log.info("请求方法："+method);
+        String path = request.getPath().toString();
+        log.info("请求路径："+path);
         log.info("请求参数："+request.getQueryParams());
         String sourceAddress = request.getRemoteAddress().getHostString();
         log.info("请求来源地址："+sourceAddress);
         //拿到响应对象
         ServerHttpResponse response = exchange.getResponse();
         //2.访问控制-添加黑白名单
-        if (!IP_WHITE_LIST.contains(sourceAddress)){
-            return handleNoAuth(response);
-        }
+        //if (!IP_WHITE_LIST.contains(sourceAddress)){
+        //    return handleNoAuth(response);
+        //}
         //3.用户鉴权（ak,sk是否正确）
-        //todo 从数据库中获取ak sk
         //3.1从请求头中获取信息
         HttpHeaders headers = request.getHeaders();
         String accessKey = headers.getFirst("accessKey");
@@ -73,15 +90,22 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         //用户信息
         String userName = headers.getFirst("userName");
 
+        User invokeUser = null;
+        try {invokeUser = userService.getInvokeUser(accessKey);
+        } catch (Exception e) {
+           log.error("invoke user error:"+e);
+        }
+        if (invokeUser==null){
+            //用户信息为空，处理未授权并返回响应
+            return handleNoAuth(response);
+        }
+
         try {
             userName=new String(headers.getFirst("userName").getBytes("ISO-8859-1"), "UTF-8");
         } catch (UnsupportedEncodingException e) {
             throw new RuntimeException(e);
         }
         //3.2验证信息
-        if (!"4ad918cf5ef7a74d9a71dbe836a3bc81".equals(accessKey)){
-            return handleNoAuth(response);
-        }
         if (nonce.length()>5){
             return handleNoAuth(response);
         }
@@ -92,15 +116,28 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             return handleNoAuth(response);
         }
         //验证签名
-        String genSign = SignUtils.genSign(userName, "c23e79e9432490b53af052e207f9a8495235b9e0");
+        String genSign = SignUtils.genSign(userName, invokeUser.getSecretKey());
         if (!sign.equals(genSign)){
             return handleNoAuth(response);
         }
         //4.请求的模拟接口是否存在
-        //todo 从数据库中查询接口是否存在，以及请求方法是否匹配(还可以检验请求参数)
+        InterfaceInfo interfaceInfo = null;
+        try {
+            interfaceInfo = interfaceInfoService.getInterfaceInfo(INTERFACE_HOST+path);
+        } catch (Exception e) {
+            log.error("interface error"+e);
+        }
+        if (interfaceInfo==null){
+            return handleNoAuth(response);
+        }
+        //验证是否还有调用次数
+        try {
+            userInterfaceInfoService.checkCount(interfaceInfo.getId(), invokeUser.getId());
+        }catch (Exception e){
+            return handleNoAuth(response);
+        }
+
         //5.请求转发，调用模拟接口
-
-
         //Spring Cloud Gateway 的处理逻辑是等待所有过滤器都执行完毕后
         // 才会继续向下走，直到最终调用被代理的服务
 
@@ -110,7 +147,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         //调用成功返回响应状态码
         log.info("响应,"+response.getStatusCode());
         //6.响应日志
-        return handleResponse(exchange,chain);
+        return handleResponse(exchange,chain,interfaceInfo.getId(),invokeUser.getId());
         //if (response.getStatusCode()==HttpStatus.OK){
         //
         //}else{
@@ -136,7 +173,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
      * @param chain
      * @return
      */
-    public Mono<Void> handleResponse(ServerWebExchange exchange,GatewayFilterChain chain){
+    public Mono<Void> handleResponse(ServerWebExchange exchange,GatewayFilterChain chain,long interfaceInfoId,long userId){
         try {
             // 获取原始的响应对象
             ServerHttpResponse originalResponse = exchange.getResponse();
@@ -149,7 +186,6 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             if(statusCode == HttpStatus.OK) {
                 // 创建一个装饰后的响应对象(开始穿装备，增强能力)装饰者模式
                 ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
-
                     // 重写writeWith方法，用于处理响应体的数据
                     // 这段方法就是只要当我们的模拟接口调用完成之后,等它返回结果，
                     // 就会调用writeWith方法,我们就能根据响应结果做一些自己的处理
@@ -162,7 +198,12 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                             // (这里就理解为它在拼接字符串,它把缓冲区的数据取出来，一点一点拼接好)
                             // 拿到返回值之后才会处理
                             return super.writeWith(fluxBody.map(dataBuffer -> {
-                                //todo 7.调用成功，接口调用次数+1 invokeCount
+                                //7.调用成功，接口调用次数+1 invokeCount
+                                try {
+                                    userInterfaceInfoService.invokeCount(interfaceInfoId, userId);
+                                } catch (Exception e) {
+                                    log.error("invokeCount error",e);
+                                }
                                 //读取响应体的内容并转换为字节数组
                                 byte[] content = new byte[dataBuffer.readableByteCount()];
                                 dataBuffer.read(content);
